@@ -140,10 +140,6 @@ def tba_team_exists(num: int) -> bool:
     return _tba_get(f"/team/frc{num}/simple") is not None
 
 
-def tba_event_exists(code: str) -> bool:
-    return _tba_get(f"/event/{code}") is not None
-
-
 def _tba_avatar_bytes(num: int, year: int) -> Optional[bytes]:
     media = _tba_get(f"/team/frc{num}/media/{year}")
     if not isinstance(media, list):
@@ -447,8 +443,6 @@ async def submit(
     ev = _clean_event(event) if event else None
     if event and not ev:
         raise HTTPException(status_code=400, detail="invalid event code")
-    if ev and ev not in _events():
-        raise HTTPException(status_code=400, detail="unknown event")
 
     try:
         img = Image.open(io.BytesIO(await file.read())).convert("RGBA")
@@ -497,8 +491,6 @@ async def upload(
     ev = _clean_event(event) if event else None
     if event and not ev:
         raise HTTPException(status_code=400, detail="invalid event code")
-    if ev and ev not in _events():
-        raise HTTPException(status_code=400, detail="unknown event")
     try:
         _store(str(team), await file.read(), ev)
     except Exception:
@@ -524,8 +516,6 @@ async def upload_zip(
     ev = _clean_event(event) if event else None
     if event and not ev:
         raise HTTPException(status_code=400, detail="invalid event code")
-    if ev and ev not in _events():
-        raise HTTPException(status_code=400, detail="unknown event")
     try:
         zf = zipfile.ZipFile(io.BytesIO(await file.read()))
     except zipfile.BadZipFile:
@@ -579,8 +569,8 @@ def event_add(
     ev = _clean_event(code)
     if not ev:
         raise HTTPException(status_code=400, detail="code must be lowercase alphanumeric")
-    if not tba_event_exists(ev):
-        raise HTTPException(status_code=400, detail=f"event {ev} not found on TBA")
+    # No TBA/existence check: the admin registers codes deliberately (offseason or
+    # custom events won't be in TBA, and submissions may target one not yet added).
     d = _events()
     d[ev] = {"name": (name or "").strip() or ev, "added": int(time.time())}
     _save_events(d)
@@ -757,7 +747,7 @@ def _portal_html(teams: list) -> str:
 <main>
   <section class="upload">
     <h2>Events</h2>
-    <p class="hint">Register a TBA event code (e.g. <code>2026mirr</code>) to upload event-specific avatars. Validated against The Blue Alliance.</p>
+    <p class="hint">Register a TBA-style event code (e.g. <code>2026mirr</code>) to upload event-specific avatars. Any lowercase alphanumeric code is accepted.</p>
     <form method="post" action="/admin/event/add" class="row">
       <label>Event code<input type="text" name="code" required placeholder="2026mirr" /></label>
       <label>Label (optional)<input type="text" name="name" placeholder="Michigan ..." /></label>
