@@ -75,6 +75,9 @@ PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://avatars.filipkin.co
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 MIN_SIZE, MAX_SIZE = 16, 1024
 DEFAULT_KEY = "default"
+# Every upload is transcoded to this one format (RGBA, lossless, transparency) so
+# the store holds a single consistent format regardless of what was uploaded.
+PREFERRED_FORMAT = "PNG"
 EVENT_RE = re.compile(r"^[a-z0-9]+$")  # TBA event key form, e.g. 2026mirr
 TBA_BASE = "https://www.thebluealliance.com/api/v3"
 # Long-lived + immutable is safe because the client's URLs carry ?v=<mtime>, so a
@@ -323,12 +326,20 @@ def _effective_version(team: int, event: Optional[str]) -> int:
     return _version(str(team))
 
 
+def _save_png(img: Image.Image, path: str) -> None:
+    """Write `img` in the store's preferred format (RGBA PNG, optimized). Every
+    upload is transcoded through here, so whatever was uploaded (jpg/webp/gif/...)
+    ends up as one consistent format on disk."""
+    if img.mode != "RGBA":
+        img = img.convert("RGBA")
+    img.save(path, format=PREFERRED_FORMAT, optimize=True)
+
+
 def _store(key: str, data: bytes, event: Optional[str] = None) -> None:
-    """Save uploaded bytes as a full-resolution RGBA PNG under `key`."""
+    """Transcode uploaded bytes to a full-resolution preferred-format image under `key`."""
     p = _path(key, event)
     os.makedirs(os.path.dirname(p), exist_ok=True)
-    img = Image.open(io.BytesIO(data)).convert("RGBA")
-    img.save(p)
+    _save_png(Image.open(io.BytesIO(data)), p)
 
 
 def _scaled(key: str, s: int, event: Optional[str] = None) -> str:
@@ -343,7 +354,7 @@ def _scaled(key: str, s: int, event: Optional[str] = None) -> str:
     out = ImageOps.pad(
         img, (s, s), method=Image.LANCZOS, color=(0, 0, 0, 0), centering=(0.5, 0.5)
     )
-    out.save(cache)
+    _save_png(out, cache)
     return cache
 
 
@@ -443,9 +454,14 @@ async def submit(
         img = Image.open(io.BytesIO(await file.read())).convert("RGBA")
     except Exception:
         raise HTTPException(status_code=400, detail="not a readable image")
+    if img.width != img.height:
+        raise HTTPException(
+            status_code=400,
+            detail=f"image must be square (got {img.width}x{img.height})",
+        )
 
     pid = secrets.token_hex(8)
-    img.save(os.path.join(PENDING_DIR, f"{pid}.png"))
+    _save_png(img, os.path.join(PENDING_DIR, f"{pid}.png"))
     meta = {
         "id": pid,
         "team": team,
@@ -875,8 +891,7 @@ def _submit_html(events_items: list) -> str:
         '<label>Event<select name="event"><option value="">Team default</option>'
         + options
         + "</select></label>"
-        '<label>Image<input type="file" name="file" accept="image/*" required '
-        "onchange=\"const p=document.getElementById('preview'); if(this.files[0]){p.src=URL.createObjectURL(this.files[0]); p.style.display='block';}\" /></label>"
+        '<label>Image (must be square)<input type="file" name="file" id="file" accept="image/*" required /></label>'
         '<img id="preview" alt="preview" />'
         '<button type="submit">Submit for review</button>'
         "</div></form>"
@@ -899,14 +914,16 @@ def _public_html(teams: list) -> str:
     cards = ""
     if default_v:
         cards += (
+            f'<a class="card-link" href="/avatar/default.png">'
             f'<figure><img src="/avatar/default.png?s=96&v={default_v}" alt="default" '
             f'loading="lazy" /><figcaption>default'
-            f'<a class="dim" href="/avatar/default.png">{_dims(DEFAULT_KEY)}</a></figcaption></figure>'
+            f'<span class="dim">{_dims(DEFAULT_KEY)}</span></figcaption></figure></a>'
         )
     cards += "".join(
+        f'<a class="card-link" href="/avatar/{t}.png">'
         f'<figure><img src="/avatar/{t}.png?s=96&v={_version(str(t))}" alt="Team {t}" '
         f'loading="lazy" /><figcaption>{t}'
-        f'<a class="dim" href="/avatar/{t}.png">{_dims(str(t))}</a></figcaption></figure>'
+        f'<span class="dim">{_dims(str(t))}</span></figcaption></figure></a>'
         for t in teams
     )
     if not cards:
@@ -972,6 +989,31 @@ const msg = (t, err) => { $('msg').textContent = t; $('msg').style.color = err ?
 $('signin').onclick = () => auth.signInWithPopup(provider).catch((e) => msg(e.message, true));
 $('signout').onclick = () => auth.signOut();
 
+// Preview the chosen image and require it to be square (the server enforces this
+// too, but check up front so the user is not surprised after submitting).
+let squareOk = false;
+$('file').onchange = () => {
+  const f = $('file').files[0];
+  $('preview').style.display = 'none';
+  squareOk = false;
+  if (!f) return;
+  const url = URL.createObjectURL(f);
+  const probe = new Image();
+  probe.onload = () => {
+    $('preview').src = url;
+    $('preview').style.display = 'block';
+    squareOk = probe.naturalWidth === probe.naturalHeight;
+    msg(
+      squareOk
+        ? ''
+        : `Image must be square: yours is ${probe.naturalWidth}x${probe.naturalHeight}.`,
+      !squareOk
+    );
+  };
+  probe.onerror = () => msg('That file is not a readable image.', true);
+  probe.src = url;
+};
+
 auth.onAuthStateChanged((u) => {
   if (u) {
     $('who').textContent = 'Signed in as ' + (u.displayName || u.email);
@@ -990,6 +1032,7 @@ $('form').onsubmit = async (e) => {
   e.preventDefault();
   const user = auth.currentUser;
   if (!user) { msg('Sign in first.', true); return; }
+  if (!squareOk) { msg('Image must be square (width = height).', true); return; }
   msg('Submitting...');
   try {
     const token = await user.getIdToken();
@@ -1045,6 +1088,9 @@ _STYLE = """<style>
   .events { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
   .event-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; background: #0f1216; border: 1px solid #2a2f38; border-radius: 8px; padding: 8px 12px; font-size: 14px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 16px; }
+  a.card-link { text-decoration: none; color: inherit; display: block; }
+  a.card-link figure { transition: border-color 0.12s; height: 100%; }
+  a.card-link:hover figure { border-color: #3b82f6; }
   figure { margin: 0; background: #1b1f26; border: 1px solid #2a2f38; border-radius: 12px; padding: 12px; text-align: center; }
   figure img { width: 96px; height: 96px; object-fit: contain; background: #0f1216; border-radius: 8px; }
   figcaption { margin: 8px 0; font-weight: 600; }
