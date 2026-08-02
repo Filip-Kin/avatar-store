@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+
+# Runtime data (backed up separately via Duplicacy + Nextcloud, not code).
+uploads/
+pending/
+cache/
