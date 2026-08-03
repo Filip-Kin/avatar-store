@@ -929,7 +929,7 @@ def _public_html(teams: list) -> str:
         "GET /avatar/default.png?s=160   # fallback avatar for teams with no upload\n\n"
         "# drop the ?s= to get the original full-resolution image\n"
         "# add &amp;v=&lt;version from /avatars&gt; so a re-upload busts the cache\n\n"
-        '&lt;img src="https://avatars.filipkin.com/avatar/254.png?s=160"&gt;'
+        f'&lt;img src="{PUBLIC_BASE_URL}/avatar/254.png?s=160"&gt;'
     )
 
     return (
@@ -941,7 +941,7 @@ def _public_html(teams: list) -> str:
         '<p><a href="/submit">Submit an avatar for your team &rarr;</a></p></header>'
         "<main>"
         '<section class="api"><h2>API</h2>'
-        '<p>Base URL <code>https://avatars.filipkin.com</code> &middot; CORS-enabled &middot; '
+        f'<p>Base URL <code>{PUBLIC_BASE_URL}</code> &middot; CORS-enabled &middot; '
         "Cloudflare-cached &middot; use any endpoint directly as an <code>&lt;img src&gt;</code>.</p>"
         "<pre>" + examples + "</pre></section>"
         '<section><h2>Uploaded avatars (' + str(len(teams)) + ")</h2>"
