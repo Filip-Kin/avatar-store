@@ -659,9 +659,13 @@ def _remove_pending(pid: str) -> None:
 
 # #region public landing page
 @app.get("/", response_class=HTMLResponse)
-def index():
+def index(event: Optional[str] = None):
+    ev = _clean_event(event) if event else None
+    # Event view shows the effective set: teams with an event upload OR a team
+    # default (event uploads override). Default view = team defaults only.
+    teams = sorted(_team_defaults() | _event_teams(ev)) if ev else _teams()
     return HTMLResponse(
-        _public_html(_teams()), headers={"Cache-Control": "public, max-age=60"}
+        _public_html(teams, ev), headers={"Cache-Control": "public, max-age=60"}
     )
 # #endregion
 
@@ -899,23 +903,48 @@ def _submit_done_html(team: int) -> str:  # unused (POST returns JSON) but kept 
     return f"<p>Thanks. Team {team} submission received.</p>"
 
 
-def _public_html(teams: list) -> str:
+def _public_html(teams: list, event: Optional[str] = None) -> str:
+    events = _events()
+    event_set = _event_teams(event) if event else set()
+
+    # Event selector: navigates to /?event=CODE (or / for the default view). A
+    # page reload keeps it Cloudflare-cache-friendly (URL is the cache key).
+    opts = [
+        f'<option value=""{"" if event else " selected"}>All teams (default avatars)</option>'
+    ]
+    for code, meta in sorted(events.items()):
+        name = meta.get("name", code)
+        sel = " selected" if code == event else ""
+        opts.append(f'<option value="{code}"{sel}>{code} ({name})</option>')
+    selector = (
+        '<div class="eventbar"><label>View event '
+        "<select onchange=\"location = this.value ? '/?event=' + this.value : '/'\">"
+        + "".join(opts)
+        + "</select></label></div>"
+    )
+
     default_v = _version(DEFAULT_KEY)
     cards = ""
-    if default_v:
+    if default_v and not event:
         cards += (
             f'<a class="card-link" href="/avatar/default.png">'
             f'<figure><img src="/avatar/default.png?s=96&v={default_v}" alt="default" '
             f'loading="lazy" /><figcaption>default'
             f'<span class="dim">{_dims(DEFAULT_KEY)}</span></figcaption></figure></a>'
         )
-    cards += "".join(
-        f'<a class="card-link" href="/avatar/{t}.png">'
-        f'<figure><img src="/avatar/{t}.png?s=96&v={_version(str(t))}" alt="Team {t}" '
-        f'loading="lazy" /><figcaption>{t}'
-        f'<span class="dim">{_dims(str(t))}</span></figcaption></figure></a>'
-        for t in teams
-    )
+    for t in teams:
+        has_ev = t in event_set
+        ver = _effective_version(t, event)
+        dims = _dims(str(t), event if has_ev else None)
+        q = f"?s=96&v={ver}" + (f"&event={event}" if event else "")
+        href = f"/avatar/{t}.png" + (f"?event={event}" if event else "")
+        badge = '<span class="badge">event</span>' if has_ev else ""
+        cards += (
+            f'<a class="card-link" href="{href}">'
+            f'<figure><img src="/avatar/{t}.png{q}" alt="Team {t}" '
+            f'loading="lazy" /><figcaption>{t}{badge}'
+            f'<span class="dim">{dims}</span></figcaption></figure></a>'
+        )
     if not cards:
         cards = '<p class="empty">No avatars uploaded yet.</p>'
 
@@ -944,8 +973,16 @@ def _public_html(teams: list) -> str:
         f'<p>Base URL <code>{PUBLIC_BASE_URL}</code> &middot; CORS-enabled &middot; '
         "Cloudflare-cached &middot; use any endpoint directly as an <code>&lt;img src&gt;</code>.</p>"
         "<pre>" + examples + "</pre></section>"
-        '<section><h2>Uploaded avatars (' + str(len(teams)) + ")</h2>"
-        '<div class="grid">' + cards + "</div></section>"
+        "<section>"
+        + (
+            f"<h2>Avatars for {event} ({len(teams)})</h2>"
+            if event
+            else f"<h2>Uploaded avatars ({len(teams)})</h2>"
+        )
+        + selector
+        + '<div class="grid">'
+        + cards
+        + "</div></section>"
         '<footer><a href="/admin">Manage avatars &rarr;</a> (sign-in required)</footer>'
         "</main></body></html>"
     )
@@ -1089,4 +1126,8 @@ _STYLE = """<style>
   .del { background: #3a2126; color: #ff9a9a; font-size: 12px; padding: 6px 10px; }
   .del:hover { background: #52272e; }
   .empty { color: #9aa4b2; }
+  .eventbar { margin: 0 0 16px; }
+  .eventbar label { font-weight: 600; color: #9aa4b2; font-size: 14px; }
+  .eventbar select { margin-left: 8px; background: #1b1f26; color: #e8ecf1; border: 1px solid #2a2f38; border-radius: 8px; padding: 6px 10px; font: inherit; }
+  .badge { display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 700; vertical-align: middle; background: #2a2f38; color: #7fd0a0; }
 </style>"""
