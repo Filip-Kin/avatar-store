@@ -661,9 +661,9 @@ def _remove_pending(pid: str) -> None:
 @app.get("/", response_class=HTMLResponse)
 def index(event: Optional[str] = None):
     ev = _clean_event(event) if event else None
-    # Event view shows the effective set: teams with an event upload OR a team
-    # default (event uploads override). Default view = team defaults only.
-    teams = sorted(_team_defaults() | _event_teams(ev)) if ev else _teams()
+    # Event view shows ONLY teams with an event-specific upload (no team-default
+    # fallback - that's the intended UX). Default view = team defaults only.
+    teams = sorted(_event_teams(ev)) if ev else _teams()
     return HTMLResponse(
         _public_html(teams, ev), headers={"Cache-Control": "public, max-age=60"}
     )
@@ -905,7 +905,6 @@ def _submit_done_html(team: int) -> str:  # unused (POST returns JSON) but kept 
 
 def _public_html(teams: list, event: Optional[str] = None) -> str:
     events = _events()
-    event_set = _event_teams(event) if event else set()
 
     # Event selector: navigates to /?event=CODE (or / for the default view). A
     # page reload keeps it Cloudflare-cache-friendly (URL is the cache key).
@@ -933,20 +932,25 @@ def _public_html(teams: list, event: Optional[str] = None) -> str:
             f'<span class="dim">{_dims(DEFAULT_KEY)}</span></figcaption></figure></a>'
         )
     for t in teams:
-        has_ev = t in event_set
+        # Event view lists only teams that HAVE an event upload (no default
+        # fallback), so `event` resolves to the event image here; default view
+        # passes event=None and resolves to the team default.
         ver = _effective_version(t, event)
-        dims = _dims(str(t), event if has_ev else None)
+        dims = _dims(str(t), event)
         q = f"?s=96&v={ver}" + (f"&event={event}" if event else "")
         href = f"/avatar/{t}.png" + (f"?event={event}" if event else "")
-        badge = '<span class="badge">event</span>' if has_ev else ""
         cards += (
             f'<a class="card-link" href="{href}">'
             f'<figure><img src="/avatar/{t}.png{q}" alt="Team {t}" '
-            f'loading="lazy" /><figcaption>{t}{badge}'
+            f'loading="lazy" /><figcaption>{t}'
             f'<span class="dim">{dims}</span></figcaption></figure></a>'
         )
     if not cards:
-        cards = '<p class="empty">No avatars uploaded yet.</p>'
+        cards = (
+            '<p class="empty">No event-specific avatars for this event yet.</p>'
+            if event
+            else '<p class="empty">No avatars uploaded yet.</p>'
+        )
 
     # Pre-escaped so it renders literally inside <pre>.
     examples = (
