@@ -137,10 +137,7 @@ def _verify_admin_session(token: str) -> bool:
     return email.lower() in ADMIN_EMAILS
 
 
-def require_auth(
-    request: Request,
-    credentials: Optional[HTTPBasicCredentials] = Depends(security),
-) -> bool:
+def _authed(request: Request, credentials: Optional[HTTPBasicCredentials]) -> bool:
     # Left over from the old avatars.filipkin.com nginx+Authelia setup, which set
     # Remote-User after SSO. Nothing sets this header on the current Coolify/Traefik
     # deploy, so this is dead in practice, but harmless to keep for the rollback path.
@@ -151,6 +148,23 @@ def require_auth(
         return True
     # Fallback: the shared HTTP Basic password (e.g. hitting the container directly).
     if PASSWORD and credentials and secrets.compare_digest(credentials.password, PASSWORD):
+        return True
+    return False
+
+
+def require_auth(
+    request: Request,
+    credentials: Optional[HTTPBasicCredentials] = Depends(security),
+) -> bool:
+    """For POST actions and the pending-image src: fail with a plain 401.
+
+    GET /admin and GET /admin/queue do NOT use this - a raised 401 here carries
+    WWW-Authenticate: Basic, which makes the browser pop its native password
+    dialog before either page's own HTML (which offers Google sign-in) ever has
+    a chance to render. Those two routes check _authed() directly instead and
+    redirect to /admin/login on failure.
+    """
+    if _authed(request, credentials):
         return True
     raise HTTPException(
         status_code=401,
@@ -631,7 +645,9 @@ def event_delete(code: str = Form(...), _: bool = Depends(require_auth)):
 
 
 @app.get("/admin/queue", response_class=HTMLResponse)
-def admin_queue(_: bool = Depends(require_auth)):
+def admin_queue(request: Request, credentials: Optional[HTTPBasicCredentials] = Depends(security)):
+    if not _authed(request, credentials):
+        return RedirectResponse("/admin/login")
     items = []
     for pid in _pending_ids():
         try:
@@ -675,7 +691,9 @@ def queue_reject(id: str = Form(...), _: bool = Depends(require_auth)):
 
 
 @app.get("/admin", response_class=HTMLResponse)
-def portal(_: bool = Depends(require_auth)):
+def portal(request: Request, credentials: Optional[HTTPBasicCredentials] = Depends(security)):
+    if not _authed(request, credentials):
+        return RedirectResponse("/admin/login")
     return _portal_html(_teams())
 
 
