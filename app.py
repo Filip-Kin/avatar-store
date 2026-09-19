@@ -390,7 +390,7 @@ def avatars(event: Optional[str] = None):
 
 
 @app.get("/avatar/{team}")
-def avatar(team: str, s: Optional[int] = None, event: Optional[str] = None):
+def avatar(team: str, s: Optional[int] = None, event: Optional[str] = None, fallback: Optional[str] = None):
     key = team[:-4] if team.endswith(".png") else team  # allow the .png suffix
     ev = _clean_event(event) if event else None
     if key == DEFAULT_KEY:
@@ -410,6 +410,11 @@ def avatar(team: str, s: Optional[int] = None, event: Optional[str] = None):
     tba = _tba_avatar_cached(int(key))
     if tba:
         return FileResponse(tba, media_type="image/png", headers=TBA_CACHE_HEADERS)
+    # No avatar for this team. When the caller passes ?fallback=default, serve the
+    # shared default avatar instead of 404, so a client gets one image in one
+    # request with no onError retry.
+    if fallback == "default" and os.path.exists(_path(DEFAULT_KEY)):
+        return _serve_upload(DEFAULT_KEY, s, None)
     raise HTTPException(status_code=404, detail="not found")
 # #endregion
 
