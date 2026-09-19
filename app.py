@@ -22,6 +22,9 @@ Endpoints (reads are public; .png suffix so Cloudflare edge-caches them):
   GET  /submit                               -> public submission page (Google sign-in)
   POST /submit  (Bearer <firebase id token>) -> queue a proposed avatar
   GET  /                                      -> public landing page
+  GET  /admin/login                           -> admin Google sign-in page
+  POST /admin/session (Bearer <firebase id token>) -> sets the admin session cookie
+  POST /admin/logout                          -> clears the admin session cookie
   GET  /admin                                 -> upload/manage portal      (auth)
   GET  /admin/queue                           -> pending submissions        (auth)
   POST /upload | /upload-default | /upload-zip | /delete | /delete-default  (auth)
@@ -30,10 +33,13 @@ Endpoints (reads are public; .png suffix so Cloudflare edge-caches them):
 
 `v` is the file mtime; the client uses it so a re-upload becomes a fresh URL
 (instant update) while responses stay long-cached (immutable). Admin auth is
-Authelia forward-auth (Remote-User) with an HTTP Basic fallback.
+Google sign-in against an email allowlist (/admin/login, same Firebase project
+/submit uses), with the legacy HTTP Basic password kept as a fallback.
 """
 
 import base64
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -71,6 +77,13 @@ FIREBASE_AUTH_DOMAIN = (
     os.environ.get("FIREBASE_AUTH_DOMAIN") or f"{FIREBASE_PROJECT_ID}.firebaseapp.com"
 )
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://avatars.filipkin.com").rstrip("/")
+# Google accounts allowed into /admin, checked against the Firebase ID token's
+# email claim. Comma-separated, case-insensitive.
+ADMIN_EMAILS = {
+    e.strip().lower() for e in os.environ.get("ADMIN_EMAILS", "").split(",") if e.strip()
+}
+ADMIN_SESSION_COOKIE = "admin_session"
+ADMIN_SESSION_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 MIN_SIZE, MAX_SIZE = 16, 1024
@@ -98,20 +111,45 @@ app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
 
-# auto_error=False so we can accept EITHER Authelia forward-auth (nginx sets Remote-User
-# after SSO) OR the legacy HTTP Basic password (for direct/un-proxied container access).
+# auto_error=False so we can accept EITHER a signed-in admin session OR the legacy
+# HTTP Basic password.
 security = HTTPBasic(auto_error=False)
+
+
+def _sign_admin_session(email: str, expires: int) -> str:
+    msg = f"{email}|{expires}"
+    sig = hmac.new(PASSWORD.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{msg}|{sig}".encode()).decode()
+
+
+def _verify_admin_session(token: str) -> bool:
+    """True iff the cookie is unexpired, correctly signed, and its email is allowlisted."""
+    try:
+        email, expires_s, sig = base64.urlsafe_b64decode(token.encode()).decode().split("|")
+        expires = int(expires_s)
+    except Exception:
+        return False
+    if time.time() > expires:
+        return False
+    expected = hmac.new(PASSWORD.encode(), f"{email}|{expires_s}".encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        return False
+    return email.lower() in ADMIN_EMAILS
 
 
 def require_auth(
     request: Request,
     credentials: Optional[HTTPBasicCredentials] = Depends(security),
 ) -> bool:
-    # Behind avatars.filipkin.com, Authelia forward-auth gates these routes and nginx passes
-    # the authenticated user in Remote-User -> no second password prompt (unified SSO).
+    # Left over from the old avatars.filipkin.com nginx+Authelia setup, which set
+    # Remote-User after SSO. Nothing sets this header on the current Coolify/Traefik
+    # deploy, so this is dead in practice, but harmless to keep for the rollback path.
     if request.headers.get("Remote-User"):
         return True
-    # Fallback: HTTP Basic (e.g. hitting the container directly, bypassing nginx).
+    session = request.cookies.get(ADMIN_SESSION_COOKIE)
+    if session and _verify_admin_session(session):
+        return True
+    # Fallback: the shared HTTP Basic password (e.g. hitting the container directly).
     if PASSWORD and credentials and secrets.compare_digest(credentials.password, PASSWORD):
         return True
     raise HTTPException(
@@ -639,6 +677,39 @@ def queue_reject(id: str = Form(...), _: bool = Depends(require_auth)):
 @app.get("/admin", response_class=HTMLResponse)
 def portal(_: bool = Depends(require_auth)):
     return _portal_html(_teams())
+
+
+@app.get("/admin/login", response_class=HTMLResponse)
+def admin_login():
+    return _admin_login_html()
+
+
+@app.post("/admin/session")
+async def admin_session(request: Request):
+    body = await request.json()
+    claims = verify_firebase_token(body.get("idToken", ""))
+    email = (claims.get("email") or "").lower()
+    if not email or email not in ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="that Google account is not an admin")
+    expires = int(time.time()) + ADMIN_SESSION_MAX_AGE
+    token = _sign_admin_session(email, expires)
+    resp = JSONResponse({"ok": True})
+    resp.set_cookie(
+        ADMIN_SESSION_COOKIE,
+        token,
+        max_age=ADMIN_SESSION_MAX_AGE,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+    )
+    return resp
+
+
+@app.post("/admin/logout")
+def admin_logout():
+    resp = RedirectResponse("/admin/login", status_code=303)
+    resp.delete_cookie(ADMIN_SESSION_COOKIE)
+    return resp
 # #endregion
 
 
@@ -751,7 +822,8 @@ def _portal_html(teams: list) -> str:
 <header>
   <h1>Avatar Store</h1>
   <p>Upload team avatars (any resolution). The audience display scales them and uses them in place of the blurry FMS avatars.</p>
-  <p><a href="/admin/queue">Pending submissions ({pending_n})</a> &middot; <a href="/submit">Public submit page</a></p>
+  <p><a href="/admin/queue">Pending submissions ({pending_n})</a> &middot; <a href="/submit">Public submit page</a>
+  &middot; <form method="post" action="/admin/logout" style="display:inline"><button class="del" type="submit">Sign out</button></form></p>
 </header>
 <main>
   <section class="upload">
@@ -854,6 +926,33 @@ def _queue_html(items: list) -> str:
 </main>
 </body>
 </html>"""
+
+
+def _admin_login_html() -> str:
+    # Same public web config as /submit; the apiKey is a client identifier, not a
+    # secret. Its own tiny script so _ADMIN_LOGIN_JS needs no f-string escaping.
+    config_script = (
+        "<script>window.FB={"
+        f'apiKey:"{FIREBASE_API_KEY}",'
+        f'authDomain:"{FIREBASE_AUTH_DOMAIN}",'
+        f'projectId:"{FIREBASE_PROJECT_ID}"'
+        "};</script>"
+    )
+    return (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\" />"
+        '<meta name="viewport" content="width=device-width, initial-scale=1" />'
+        "<title>Admin sign-in</title>" + _STYLE + "</head><body>"
+        "<header><h1>Avatar Store admin</h1></header>"
+        "<main><section class=\"upload\">"
+        '<button id="signin" type="button">Sign in with Google</button>'
+        '<p id="msg" class="hint"></p>'
+        "</section></main>"
+        + config_script
+        + '<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>'
+        + '<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>'
+        + "<script>" + _ADMIN_LOGIN_JS + "</script>"
+        + "</body></html>"
+    )
 
 
 def _submit_html(events_items: list) -> str:
@@ -1087,6 +1186,35 @@ $('form').onsubmit = async (e) => {
     }
   } catch (err) {
     msg(err.message, true);
+  }
+};
+"""
+
+_ADMIN_LOGIN_JS = """
+firebase.initializeApp(window.FB);
+const auth = firebase.auth();
+const provider = new firebase.auth.GoogleAuthProvider();
+const $ = (id) => document.getElementById(id);
+const msg = (t, err) => { $('msg').textContent = t; $('msg').style.color = err ? '#ff9a9a' : '#9aa4b2'; };
+
+$('signin').onclick = async () => {
+  try {
+    const cred = await auth.signInWithPopup(provider);
+    const token = await cred.user.getIdToken();
+    const res = await fetch('/admin/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ idToken: token }),
+    });
+    if (res.ok) {
+      location = '/admin';
+    } else {
+      const j = await res.json().catch(() => ({}));
+      msg(j.detail || ('Error ' + res.status), true);
+      auth.signOut();
+    }
+  } catch (e) {
+    msg(e.message, true);
   }
 };
 """
